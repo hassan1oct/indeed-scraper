@@ -1,5 +1,8 @@
 import time
 import pandas as pd
+import logging
+import os
+import csv
 from urllib.parse import urlparse
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
@@ -7,28 +10,26 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+from multiprocessing import Pool
 
-# Initialize Chromedriver
-driver_path = ChromeDriverManager().install()
-service = ChromeService(driver_path)
-options = webdriver.ChromeOptions()
-options.add_argument("--headless")  # Run in headless mode for faster execution
-options.add_argument("--disable-gpu")  # Disable GPU for faster execution
-options.add_argument("--no-sandbox")  # Bypass OS security model
-options.add_argument("--disable-dev-shm-usage")  # Overcome limited resource problems
-driver = webdriver.Chrome(service=service, options=options)
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Load the filtered CSV
-filtered_csv_path = '/home/karan/scraper/indeed_company.csv'
-df = pd.read_csv(filtered_csv_path)
+def create_driver():
+    driver_path = ChromeDriverManager().install()
+    service = ChromeService(driver_path)
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    return webdriver.Chrome(service=service, options=options)
 
-# Function to get the base URL
 def get_base_url(url):
     parsed_url = urlparse(url)
     return f"{parsed_url.scheme}://{parsed_url.netloc}/"
 
-# Function to search for company websites on Google
-def get_company_website(company_name):
+def get_company_website(driver, company_name):
     search_query = f"{company_name} official site"
     google_search_url = f"https://www.google.com/search?q={search_query}"
     driver.get(google_search_url)
@@ -60,11 +61,10 @@ def get_company_website(company_name):
             return get_base_url(candidate_links[0])
 
     except Exception as e:
-        print(f"Error fetching website for {company_name}: {e}")
+        logging.error(f"Error fetching website for {company_name}: {e}")
     return None
 
-# Function to search for LinkedIn URLs on Google and copy the link address
-def get_linkedin_url(company_name, location):
+def get_linkedin_url(driver, company_name, location):
     if "remote" in location.lower() or "hybrid" in location.lower():
         search_query = f"{company_name} LinkedIn"
     else:
@@ -83,33 +83,75 @@ def get_linkedin_url(company_name, location):
                 return link
         
     except Exception as e:
-        print(f"Error fetching LinkedIn URL for {company_name}: {e}")
+        logging.error(f"Error fetching LinkedIn URL for {company_name}: {e}")
     return None
 
-# List to store company details
-company_details = []
+def process_company(company_data):
+    driver = create_driver()
+    company_name = company_data['Company Name']
+    job_title = company_data['Job Title']
+    location = company_data['Location']
 
-# Iterate through the DataFrame and get the website and LinkedIn URLs
-for index, row in df.iterrows():
-    company_name = row['Company Name']
-    location = row['Location']
-    website_url = get_company_website(company_name)
-    linkedin_url = get_linkedin_url(company_name, location)
-    company_details.append({
+    website_url = get_company_website(driver, company_name)
+    linkedin_url = get_linkedin_url(driver, company_name, location)
+    result = {
         'Company Name': company_name,
-        'Job Title': row['Job Title'],
+        'Job Title': job_title,
         'Location': location,
         'Website URL': website_url,
         'LinkedIn URL': linkedin_url
-    })
-    time.sleep(1)  # Add a delay between iterations
+    }
+    logging.info(f"Processed company: {company_name}, Website URL: {website_url}, LinkedIn URL: {linkedin_url}")
 
-# Convert to DataFrame and save to CSV
-output_df = pd.DataFrame(company_details)
-output_csv_path = '/home/karan/scraper/company_details.csv'
-output_df.to_csv(output_csv_path, index=False)
+    # Update the CSV file
+    csv_file_path = 'company_details.csv'
+    file_exists = os.path.isfile(csv_file_path)
+    with open(csv_file_path, 'a', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=result.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(result)
+    
+    driver.quit()
 
-print(f"Company details saved to {output_csv_path}")
+def get_already_processed_companies():
+    if os.path.exists('company_details.csv'):
+        df = pd.read_csv('company_details.csv')
+        return set(df['Company Name'].tolist())
+    return set()
 
-# Close the browser
-driver.quit()
+def run_company_processing():
+    # Wait for the start signal
+    while not os.path.exists("/home/karan/scraper/start_company_details.txt"):
+        time.sleep(1)
+
+    filtered_csv_path = '/home/karan/scraper/indeed_company.csv'
+    df = pd.read_csv(filtered_csv_path)
+
+    # Get already processed companies
+    processed_companies = get_already_processed_companies()
+
+    # Log the number of processed companies
+    logging.info(f"Number of already processed companies: {len(processed_companies)}")
+
+    # Filter out the companies that have already been processed
+    companies_to_process = df[~df['Company Name'].isin(processed_companies)]
+
+    # Log the number of companies to be processed
+    logging.info(f"Number of companies to process: {len(companies_to_process)}")
+
+    # Create a pool of worker processes
+    pool = Pool(processes=4)  # Adjust the number of processes as needed
+
+    # Iterate through the DataFrame and process each company using multiprocessing
+    pool.map(process_company, [row for _, row in companies_to_process.iterrows()])
+
+    # Close the pool and wait for all processes to finish
+    pool.close()
+    pool.join()
+
+    logging.info("All companies have been processed.")
+    print("Processing complete.")
+
+if __name__ == "__main__":
+    run_company_processing()
