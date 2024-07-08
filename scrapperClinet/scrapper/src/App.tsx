@@ -4,17 +4,19 @@ import TableData from "./components/TableData";
 import { Box } from "@mui/material";
 import { io } from "socket.io-client";
 
+
 const App = () => {
   const [value, setValue] = useState("");
   const [loading, setLoading] = useState(false);
   const [response, setResponse] = useState(null);
-  const [records, setRecords] = useState<any[]>([]); // State to hold incoming records
+  const [newRecords, setRecords] = useState<any[]>([]);
+  const [ioInstance, setIoInstance] = useState<any>(null);
 
   const abortControllerRef = useRef<AbortController | null>(null);
   let link = "https://www.indeed.com/jobs?q=node+js+developer";
 
   const handleChange = (e: ChangeEvent<HTMLInputElement>) => {
-    setValue(e?.target?.value);
+    setValue(e.target.value);
   };
 
   const startScraping = async () => {
@@ -30,9 +32,9 @@ const App = () => {
         signal,
       });
 
-      const data = await res?.json();
+      const data = await res.json();
       setResponse(data);
-      console.log("here");
+      console.log("Scraping completed");
     } catch (error) {
       console.error("Error:", error);
     } finally {
@@ -47,21 +49,18 @@ const App = () => {
   };
 
   const handleCancelRequest = () => {
-    if (abortControllerRef?.current) {
-      abortControllerRef?.current?.abort();
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
     }
   };
 
   useEffect(() => {
-    const socket = io("http://localhost:5000"); // Adjust the URL if needed
+    const socket = io("http://localhost:5000");
+    console.log(socket, "-->");
+    setIoInstance(socket);
 
     socket.on("connect", () => {
       console.log("Connected to Socket.IO server");
-    });
-
-    socket.on("new_record", (data) => {
-      console.log("New record received:", data);
-      setRecords((prevRecords) => [...prevRecords, data]); // Update the records state
     });
 
     socket.on("disconnect", () => {
@@ -72,9 +71,25 @@ const App = () => {
       socket.off("connect");
       socket.off("new_record");
       socket.off("disconnect");
+      socket.disconnect();
       socket.close();
     };
   }, []);
+
+  useEffect(() => {
+    if (ioInstance) {
+      ioInstance.on("error", (error) => {
+        console.log("Socket.IO error:", error);
+      });
+
+      ioInstance.on("new_record", (record: any) => {
+        console.log("New record received:", record);
+        
+        setRecords((prevRecords) => [...prevRecords, record]);
+      });
+    }
+  }, [ioInstance]);
+  console.log(newRecords, "newrec");
 
   return (
     <div className=" bg-black flex flex-col text-white gap-10 py-10 h-[100vh]">
@@ -87,7 +102,7 @@ const App = () => {
           handleCancelRequest={handleCancelRequest}
         />
       </Box>
-      <TableData records={records} /> {/* Pass records to TableData */}
+      <TableData records={newRecords} /> {/* Pass records to TableData */}
     </div>
   );
 };

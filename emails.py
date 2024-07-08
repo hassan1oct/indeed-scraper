@@ -1,16 +1,20 @@
 import csv
 import time
 import pandas as pd
-import requests
 import os
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import tldextract
+import smtplib
+import dns.resolver
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from queue import Queue
 import threading
 from flask_socketio import SocketIO
 from flask import Flask
+from random import randint
+import joblib
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -18,131 +22,173 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Function to get email from Findymail API using LinkedIn URL
-def get_email_from_linkedin(linkedin_url, api_key):
-    endpoint = "https://app.findymail.com/api/search/linkedin"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    data = {
-        "linkedin_url": linkedin_url
-    }
-    response = requests.post(endpoint, headers=headers, json=data)
-    if response.status_code == 200:
-        result = response.json()
-        return result.get("contact", {}).get("email")
-    else:
-        logging.error(f"Error fetching email for {linkedin_url}: {response.status_code}, {response.text}")
+# Load the pre-trained model
+model = joblib.load('email_model_advanced.pkl')
+
+# Function to generate email patterns
+def generate_email_patterns(name, domain):
+    name_parts = name.lower().split()
+    if len(name_parts) < 2:
+        logging.error(f"Name {name} does not have enough parts to generate patterns.")
+        return []
+    patterns = [
+        f"{name_parts[0][0]}{name_parts[1]}@{domain}",           # jdoe@domain.com
+        f"{name_parts[0]}@{domain}",                             # joe@domain.com
+        f"{name_parts[1]}@{domain}",                             # doe@domain.com
+        f"{name_parts[0]}.{name_parts[1]}@{domain}",             # joe.doe@domain.com
+        f"{name_parts[0]}_{name_parts[1]}@{domain}",             # joe_doe@domain.com
+        f"{name_parts[0]}{name_parts[1]}@{domain}",              # joedoe@domain.com
+        f"{name_parts[0][0]}.{name_parts[1]}@{domain}",          # j.doe@domain.com
+        f"{name_parts[0][0]}_{name_parts[1]}@{domain}",          # j_doe@domain.com
+        f"{name_parts[0][0]}{name_parts[1][0]}@{domain}",        # jd@domain.com
+        f"{name_parts[0]}.{name_parts[0][0]}{name_parts[1]}@{domain}",  # joe.j.doe@domain.com
+        f"{name_parts[0][0]}{name_parts[0]}.{name_parts[1]}@{domain}",  # j.joe.doe@domain.com
+        f"{name_parts[1]}.{name_parts[0]}@{domain}",             # doe.joe@domain.com
+        f"{name_parts[1]}_{name_parts[0]}@{domain}",             # doe_joe@domain.com
+        f"{name_parts[1]}{name_parts[0]}@{domain}",              # doejoe@domain.com
+        f"{name_parts[0][0]}{name_parts[1][0]}@mail.{domain}",   # jd@mail.domain.com
+    ]
+    return patterns
+
+# Function to get MX records for a domain
+def get_mx_records(domain):
+    try:
+        records = dns.resolver.resolve(domain, 'MX')
+        return [str(r.exchange) for r in records]
+    except Exception as e:
+        logging.error(f"Error fetching MX records for domain {domain}: {str(e)}")
+        return []
+
+# Function to verify email using SMTP with persistent connections and retries
+def verify_email(email, mx_records, server_pool):
+    retries = 3
+    backoff_time = 5  # in seconds
+
+    for mx in mx_records:
+        for attempt in range(retries):
+            if mx not in server_pool:
+                try:
+                    server = smtplib.SMTP(mx)
+                    server.set_debuglevel(0)
+                    server.connect(mx)
+                    server.helo('example.com')
+                    server_pool[mx] = server
+                except Exception as e:
+                    logging.error(f"Exception during SMTP connection setup: {str(e)}")
+                    if attempt < retries - 1:
+                        time.sleep(backoff_time * (2 ** attempt))
+                    continue
+
+            server = server_pool[mx]
+            try:
+                server.mail('test@example.com')
+                code, message = server.rcpt(email)
+                if code == 250:
+                    return True
+            except smtplib.SMTPServerDisconnected as e:
+                logging.error(f"SMTP server disconnected during verification: {str(e)}")
+                server_pool.pop(mx, None)  # Remove the server from the pool
+            except Exception as e:
+                logging.error(f"Exception during SMTP verification: {str(e)}")
+                if attempt < retries - 1:
+                    time.sleep(backoff_time * (2 ** attempt))
+                continue
+    return False
+
+# Function to find email with concurrency
+def find_email(name, domain):
+    # Extract the registered domain
+    domain = tldextract.extract(domain).registered_domain
+    
+    # Generate email patterns
+    email_patterns = generate_email_patterns(name, domain)
+    
+    # Get MX records
+    mx_records = get_mx_records(domain)
+    
+    if not mx_records:
+        logging.error(f"No MX records found for domain: {domain}")
         return None
-
-# Function to get email from Findymail API using name and domain
-def get_email_from_name(name, domain, api_key):
-    endpoint = "https://app.findymail.com/api/search/name"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    data = {
-        "name": name,
-        "domain": domain
-    }
-    response = requests.post(endpoint, headers=headers, json=data)
-    if response.status_code == 200:
-        result = response.json()
-        return result.get("contact", {}).get("email")
+    
+    server_pool = {}
+    found_email = None
+    
+    # Use ProcessPoolExecutor for multiprocessing
+    with ProcessPoolExecutor(max_workers=8) as executor:
+        future_to_email = {executor.submit(verify_email, email, mx_records, server_pool): email for email in email_patterns}
+        for future in as_completed(future_to_email):
+            email = future_to_email[future]
+            try:
+                is_valid = future.result()
+                if is_valid:
+                    found_email = email
+                    break
+            except Exception as e:
+                logging.error(f"Error verifying email {email}: {str(e)}")
+    
+    # Close all SMTP connections
+    for server in server_pool.values():
+        server.quit()
+    
+    if found_email:
+        logging.info(f"Found valid email: {found_email}")
+        return {"email": found_email, "verified": True}
     else:
-        logging.error(f"Error fetching email for {name} at {domain}: {response.status_code}, {response.text}")
-        return None
+        logging.info(f"No valid email found for {name} at {domain}")
+        return {"email": None, "verified": False}
 
-# Function to get email from Findymail API using domain and role
-def get_email_from_domain(domain, role, api_key):
-    endpoint = "https://app.findymail.com/api/search/domain"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    data = {
-        "domain": domain,
-        "roles": [role]
-    }
-    response = requests.post(endpoint, headers=headers, json=data)
-    if response.status_code == 200:
-        result = response.json()
-        contacts = result.get("contacts")
-        if contacts:
-            return contacts[0].get("email")
-        else:
-            return None
-    else:
-        logging.error(f"Error fetching email for {role} at {domain}: {response.status_code}, {response.text}")
-        return None
-
-# Function to verify email using Findymail API
-def verify_email(email, api_key):
-    endpoint = "https://app.findymail.com/api/verify"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    data = {
-        "email": email
-    }
-    response = requests.post(endpoint, headers=headers, json=data)
-    if response.status_code == 200:
-        result = response.json()
-        return result.get("verified", False)
-    else:
-        logging.error(f"Error verifying email {email}: {response.status_code}, {response.text}")
-        return False
-
-def process_email_record(record, api_key):
-    linkedin_url = record['Person LinkedIn URL']
+def process_email_record(record):
     name = record['Person Name']
     domain = record['Company URL'].split("//")[-1].split("/")[0]  # Extract domain from URL
-    designation = record['Designation']
-
-    # Try fetching email using LinkedIn URL
-    email = get_email_from_linkedin(linkedin_url, api_key)
     
-    # If email not found, try fetching email using name and domain
-    if not email:
-        email = get_email_from_name(name, domain, api_key)
+    # Find email using the new logic
+    result = find_email(name, domain)
     
-    # If email still not found, try fetching email using domain and role
-    if not email:
-        email = get_email_from_domain(domain, designation, api_key)
-    
-    if email:
-        # Verify the email
-        verified = verify_email(email, api_key)
+    if result["email"]:
+        email = result["email"]
+        verified = result["verified"]
         record['Email'] = email
         record['Verified Email'] = verified
-        logging.info(f"Fetched and verified email for {record['Person Name']} ({record['Designation']} at {record['Company Name']}): {email} (Verified: {verified})")
+        logging.info(f"Fetched and verified email for {record['Person Name']} at {domain}: {email} (Verified: {verified})")
+        
+        # Append the processed record to final.csv immediately
+        output_csv_path = '/home/karan/scraper/final.csv'
+        file_exists = os.path.isfile(output_csv_path)
+        with open(output_csv_path, 'a', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=record.keys())
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(record)
+        
+        # Emit the processed record to the frontend
+        socketio.emit('new_record', record)
+        print(record)
+
+        # Update emails.csv with new data
+        update_emails_csv(record)
+
     else:
-        logging.info(f"No email found for {record['Person Name']} ({record['Designation']} at {record['Company Name']})")
+        logging.info(f"No email found for {record['Person Name']} at {domain}")
 
-    # Append the processed record to final.csv immediately
-    output_csv_path = '/home/karan/scraper/final.csv'
-    file_exists = os.path.isfile(output_csv_path)
-    with open(output_csv_path, 'a', newline='', encoding='utf-8') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=record.keys())
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(record)
-
-    # Emit the processed record to the frontend
-    socketio.emit('new_record', record)
-    print(record)
     return record
 
+def update_emails_csv(record):
+    # Update emails.csv with the new verified data
+    emails_csv_path = '/home/karan/scraper/emails.csv'
+    new_record = {
+        'Person Name': record['Person Name'],
+        'Company URL': record['Company URL'],
+        'Email': record['Email']
+    }
+    file_exists = os.path.isfile(emails_csv_path)
+    with open(emails_csv_path, 'a', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=new_record.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(new_record)
+
 class EmailProcessor:
-    def __init__(self, api_key, num_workers=4):
-        self.api_key = api_key
+    def __init__(self, num_workers=10):
         self.queue = Queue()
         self.executor = ThreadPoolExecutor(max_workers=num_workers)
 
@@ -151,7 +197,7 @@ class EmailProcessor:
             record = self.queue.get()
             if record is None:
                 break
-            self.executor.submit(process_email_record, record, self.api_key)
+            self.executor.submit(process_email_record, record)
 
     def add_record(self, record):
         self.queue.put(record)
@@ -180,7 +226,7 @@ def watch_file(processor, filepath):
     observer.start()
     try:
         while True:
-            time.sleep(5)
+            time.sleep(randint(1, 5))  # Adding some randomness to reduce simultaneous access
     except KeyboardInterrupt:
         observer.stop()
     observer.join()
@@ -209,8 +255,7 @@ def process_existing_records(processor, filepath):
         logging.error(f"Error reading CSV file: {e}")
 
 def run_email_processing():
-    api_key = "VkxpS6yQDkO2HjzAK1eq6QdO0pLGpUWvr90PpWfo"
-    email_processor = EmailProcessor(api_key)
+    email_processor = EmailProcessor()
     
     # Start a thread to process the queue
     processing_thread = threading.Thread(target=email_processor.process_queue)
@@ -234,4 +279,4 @@ def run_email_processing():
     print("Processing complete.")
 
 if __name__ == "__main__":
-    socketio.run(app, host='0.0.0.0', port=5000)
+    socketio.run(app, debug=True, port=5000)

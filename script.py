@@ -12,9 +12,38 @@ from employeeDetails import run_employee_processing
 from emails import run_email_processing, socketio  # Import socketio from emails.py
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio.init_app(app, cors_allowed_origins="*")
 CORS(app, resources={r"/*": {"origins": "*"}})
-socketio.init_app(app)  # Initialize socketio with the Flask app
+
+@app.route('/test-socket', methods=['GET'])
+def test_socket():
+    print('Test route accessed')
+    socketio.emit('test_event', {'data': 'This is a test message'})
+    return jsonify({"message": "Test event emitted"}), 200
+
+@app.route('/runn', methods=['GET'])
+def handle_connect():
+    print('Client connected')
+    socketio.emit('new_record', 'hello')
+    return jsonify({"message": "Event emitted"}), 200
+
+# Delete specified files at the start of the script
+def delete_temporary_files():
+    files_to_delete = [
+        "/home/karan/scraper/processed_rows.txt",
+        "/home/karan/scraper/processed_email_rows.txt",
+        "/home/karan/scraper/indeed_company.csv",
+        "/home/karan/scraper/company_details.csv",
+        "/home/karan/scraper/employee_details.csv",
+        "/home/karan/scraper/start_indeed_scraper.txt",
+        "/home/karan/scraper/start_company_details.txt",
+        "/home/karan/scraper/start_employee_details.txt"
+    ]
+    for file_path in files_to_delete:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+delete_temporary_files()  # Call the function to delete files at the start
 
 def run_script(script_path, args=None):
     if args:
@@ -30,40 +59,44 @@ def wait_for_file(file_path, timeout=600):
         time.sleep(1)
 
 def run_all_scripts(indeed_page):
-    # Signal the other scripts to start
-    with open("/home/karan/scraper/start_indeed_scraper.txt", "w") as f:
-        f.write("start")
-    
-    # Start the indeed scraper
-    run_script("indeedScraper.py", [indeed_page])
+    try:
+        # Signal the other scripts to start
+        with open("/home/karan/scraper/start_indeed_scraper.txt", "w") as f:
+            f.write("start")
+        
+        # Start the indeed scraper
+        run_script("indeedScraper.py", [indeed_page])
 
-    # Wait for the indeed_company.csv file
-    wait_for_file("/home/karan/scraper/indeed_company.csv")
-    
-    # Signal the next script
-    with open("/home/karan/scraper/start_company_details.txt", "w") as f:
-        f.write("start")
+        # Wait for the indeed_company.csv file
+        wait_for_file("/home/karan/scraper/indeed_company.csv")
+        
+        # Signal the next script
+        with open("/home/karan/scraper/start_company_details.txt", "w") as f:
+            f.write("start")
 
-    # Start the company details script
-    run_script("companyDetails.py")
+        # Start the company details script
+        run_script("companyDetails.py")
 
-    # Wait for the company_details.csv file
-    wait_for_file("/home/karan/scraper/company_details.csv")
-    
-    # Signal the next script
-    with open("/home/karan/scraper/start_employee_details.txt", "w") as f:
-        f.write("start")
+        # Wait for the company_details.csv file
+        wait_for_file("/home/karan/scraper/company_details.csv")
+        
+        # Signal the next script
+        with open("/home/karan/scraper/start_employee_details.txt", "w") as f:
+            f.write("start")
 
-    # Start the employee details script
-    run_script("employeeDetails.py")
-    
-    # Wait for the employee_details.csv file
-    wait_for_file("/home/karan/scraper/employee_details.csv")
-    
-    # Run email processing
-    run_email_processing()
-    
-    print("All scripts have been executed successfully.")
+        # Start the employee details script
+        run_script("employeeDetails.py")
+        
+        # Wait for the employee_details.csv file
+        wait_for_file("/home/karan/scraper/employee_details.csv")
+        
+        # Run email processing
+        run_email_processing()
+        
+        print("All scripts have been executed successfully.")
+
+    except Exception as e:
+        print(f"Error during running scripts: {e}")
 
 @app.route('/run', methods=['POST'])
 def run():
@@ -110,20 +143,6 @@ def resume():
             # Email Processing
             run_email_processing()
             print("Resumed and completed all scripts successfully.")
-
-            # Delete temporary files after processing
-            files_to_delete = [
-                "/home/karan/scraper/processed_rows.txt",
-                "/home/karan/scraper/processed_email_rows.txt",
-                "/home/karan/scraper/indeed_company.csv",
-                "/home/karan/scraper/company_details.csv",
-                "/home/karan/scraper/employee_details.csv"
-            ]
-            for file_path in files_to_delete:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-
-            print("Temporary files deleted.")
         except Exception as e:
             print(f"Error during resuming scripts: {e}")
 
@@ -132,4 +151,4 @@ def resume():
     return jsonify({"status": "Resume process started"}), 202
 
 if __name__ == "__main__":
-    socketio.run(app, host='0.0.0.0', port=5000)
+    socketio.run(app, debug=True, port=5000)
